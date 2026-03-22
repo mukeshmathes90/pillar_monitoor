@@ -1,32 +1,31 @@
 from flask import Flask, request, jsonify
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import os
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 import traceback
 
 app = Flask(__name__)
 
 # ── CONFIG ───────────────────────────────────────────────
-SENDER_EMAIL    = os.environ.get("SENDER_EMAIL",    "pillarmonitor@gmail.com")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "zpyuxgwycshbdxng")
-RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "pillarmonitor@gmail.com")
-API_TOKEN       = os.environ.get("API_TOKEN",       "esp8266secret123")
+# We use SendGrid HTTP API (port 443) because Render free tier
+# blocks outbound SMTP (port 465/587). SendGrid free = 100 emails/day
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+SENDER_EMAIL     = os.environ.get("SENDER_EMAIL",     "pillarmonitor@gmail.com")
+RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL",  "pillarmonitor@gmail.com")
+API_TOKEN        = os.environ.get("API_TOKEN",        "esp8266secret123")
 # ────────────────────────────────────────────────────────
 
 def send_email(alert_type, crack_length, vibration, stability):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[EMAIL] Attempting: {alert_type} at {now}")
-    print(f"[EMAIL] From={SENDER_EMAIL}  To={RECIPIENT_EMAIL}  PassLen={len(SENDER_PASSWORD)}")
+    print(f"[EMAIL] Sending: {alert_type} at {now}")
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["From"]    = f"Pillar Monitor <{SENDER_EMAIL}>"
-        msg["To"]      = RECIPIENT_EMAIL
-        msg["Subject"] = f"ALERT: {alert_type}!"
+    if not SENDGRID_API_KEY:
+        print("[EMAIL] ERROR: SENDGRID_API_KEY env variable is not set!")
+        return False
 
-        body = f"""
+    body_text = f"""
 ====================================
   STRUCTURAL MONITORING ALERT
 ====================================
@@ -47,27 +46,46 @@ Please inspect the structure immediately.
 - ESP8266 Structure Monitor
 ====================================
 """
-        msg.attach(MIMEText(body, "plain"))
 
-        print("[EMAIL] Connecting smtp.gmail.com:465 ...")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
-            print("[EMAIL] Connected. Logging in...")
-            smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
-            print("[EMAIL] Login OK. Sending message...")
-            smtp.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+    payload = {
+        "personalizations": [{
+            "to": [{"email": RECIPIENT_EMAIL}]
+        }],
+        "from": {"email": SENDER_EMAIL, "name": "Pillar Monitor"},
+        "subject": f"ALERT: {alert_type}!",
+        "content": [{"type": "text/plain", "value": body_text}]
+    }
 
-        print(f"[EMAIL] SUCCESS sent at {now}")
-        return True
+    data = json.dumps(payload).encode("utf-8")
 
-    except smtplib.SMTPAuthenticationError as e:
-        print(f"[EMAIL] AUTH FAILED: {e}")
-        print("[EMAIL] Fix: Go to Google Account > Security > App Passwords > create new one")
-        return False
-    except smtplib.SMTPException as e:
-        print(f"[EMAIL] SMTP ERROR: {e}")
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
+    try:
+        print("[EMAIL] POSTing to SendGrid API...")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.status
+            print(f"[EMAIL] SendGrid response: {status}")
+            if status == 202:
+                print("[EMAIL] SUCCESS - email queued by SendGrid")
+                return True
+            else:
+                print(f"[EMAIL] Unexpected status: {status}")
+                return False
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"[EMAIL] HTTPError {e.code}: {body}")
         return False
     except Exception as e:
-        print(f"[EMAIL] UNEXPECTED ERROR: {e}")
+        print(f"[EMAIL] ERROR: {e}")
         traceback.print_exc()
         return False
 
@@ -97,21 +115,19 @@ def alert():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    key_set = "YES" if SENDGRID_API_KEY else "NO - SET IT IN RENDER ENV!"
+    return jsonify({"status": "ok", "sendgrid_key_set": key_set}), 200
 
 
 @app.route("/test", methods=["GET"])
 def test_email():
-    """
-    Open https://pillar-monitoor.onrender.com/test in browser
-    to send a real test email without needing the ESP
-    """
-    print("[TEST] Manual test triggered from browser")
+    """Open /test in browser to send a real test email"""
+    print("[TEST] Manual test triggered")
     success = send_email("TEST ALERT", 0.1234, 0.5678, False)
     if success:
-        return f"<h2 style='color:green'>✅ Test email sent to {RECIPIENT_EMAIL} — check inbox!</h2>", 200
+        return f"<h2 style='color:green'>✅ Test email sent to {RECIPIENT_EMAIL} — check inbox (also spam)!</h2>", 200
     else:
-        return "<h2 style='color:red'>❌ Email FAILED — check Render Logs tab for error details</h2>", 500
+        return "<h2 style='color:red'>❌ Email FAILED — check Render Logs tab</h2>", 500
 
 
 if __name__ == "__main__":
